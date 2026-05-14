@@ -36,6 +36,11 @@
 #include <aom/aomdx.h>
 #endif
 
+#if defined(WITH_LIBSVTAV1)
+#include <EbSvtAv1.h>
+#include <EbSvtAv1Enc.h>
+#endif
+
 #if defined(WITH_LIBYUV)
 #include <libyuv.h>
 #endif
@@ -45,7 +50,8 @@
 typedef enum
 {
 	FREERDP_AV1_BACKEND_NONE,
-	FREERDP_AV1_BACKEND_AOM
+	FREERDP_AV1_BACKEND_AOM,
+	FREERDP_AV1_BACKEND_SVTAV1
 } FREERDP_AV1_BACKEND;
 
 struct S_FREERDP_AV1_CONTEXT
@@ -77,6 +83,14 @@ struct S_FREERDP_AV1_CONTEXT
 	aom_codec_dec_cfg_t aomDcfg;
 	aom_enc_frame_flags_t aomEflags;
 	aom_codec_flags_t aomFlags;
+#endif
+
+#if defined(WITH_LIBSVTAV1)
+	EbComponentType* svt;
+	bool svtInitialized;
+	EbSvtAv1EncConfiguration svtCfg;
+	EbBufferHeaderType svtInput;
+	EbSvtIOFormat svtPicture;
 #endif
 
 };
@@ -123,12 +137,14 @@ WINPR_ATTR_NODISCARD
 static const char* av1_backend_name(FREERDP_AV1_BACKEND backend)
 {
 	switch (backend)
-	{
-		case FREERDP_AV1_BACKEND_AOM:
-			return "libaom";
-		case FREERDP_AV1_BACKEND_NONE:
-		default:
-			return "none";
+		{
+			case FREERDP_AV1_BACKEND_AOM:
+				return "libaom";
+			case FREERDP_AV1_BACKEND_SVTAV1:
+				return "SVT-AV1";
+			case FREERDP_AV1_BACKEND_NONE:
+			default:
+				return "none";
 	}
 }
 
@@ -364,6 +380,13 @@ static FREERDP_AV1_BACKEND av1_select_backend(const FREERDP_AV1_CONTEXT* av1)
 		switch (av1->profile)
 		{
 			case 0:
+#if defined(WITH_LIBSVTAV1)
+				return FREERDP_AV1_BACKEND_SVTAV1;
+#elif defined(WITH_LIBAOM)
+				return FREERDP_AV1_BACKEND_AOM;
+#else
+				return FREERDP_AV1_BACKEND_NONE;
+#endif
 			case 1:
 #if defined(WITH_LIBAOM)
 				return FREERDP_AV1_BACKEND_AOM;
@@ -387,7 +410,17 @@ static FREERDP_AV1_BACKEND av1_fallback_backend(const FREERDP_AV1_CONTEXT* av1,
                                                 FREERDP_AV1_BACKEND failed)
 {
 	WINPR_ASSERT(av1);
-	WINPR_UNUSED(failed);
+
+	if (av1->encoder)
+	{
+		if ((failed == FREERDP_AV1_BACKEND_SVTAV1) && (av1->profile == 0))
+		{
+#if defined(WITH_LIBAOM)
+			return FREERDP_AV1_BACKEND_AOM;
+#endif
+		}
+	}
+
 	return FREERDP_AV1_BACKEND_NONE;
 }
 
@@ -457,6 +490,106 @@ static void av1_aom_uninit(FREERDP_AV1_CONTEXT* av1)
 }
 #endif
 
+#if defined(WITH_LIBSVTAV1)
+WINPR_ATTR_NODISCARD
+static uint8_t av1_svt_ratecontrol(UINT32 ratecontrol)
+{
+	switch (ratecontrol)
+	{
+		case FREERDP_AV1_VBR:
+		case FREERDP_AV1_CBR:
+			/* SVT-AV1 3.1.2 does not support VBR with low-delay prediction. */
+			return SVT_AV1_RC_MODE_CBR;
+		case FREERDP_AV1_CQ:
+		case FREERDP_AV1_Q:
+		default:
+			return SVT_AV1_RC_MODE_CQP_OR_CRF;
+	}
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL av1_svt_init(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
+{
+	WINPR_ASSERT(av1);
+	WINPR_ASSERT(av1->encoder);
+
+	EbErrorType err = svt_av1_enc_init_handle(&av1->svt, &av1->svtCfg);
+	if (err != EB_ErrorNone)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_init_handle: 0x%08" PRIx32, (UINT32)err);
+		return FALSE;
+	}
+
+	av1->svtCfg.source_width = width;
+	av1->svtCfg.source_height = height;
+	av1->svtCfg.forced_max_frame_width = width;
+	av1->svtCfg.forced_max_frame_height = height;
+	av1->svtCfg.frame_rate_numerator = 60;
+	av1->svtCfg.frame_rate_denominator = 1;
+	av1->svtCfg.encoder_bit_depth = 8;
+	av1->svtCfg.encoder_color_format = EB_YUV420;
+	av1->svtCfg.profile = MAIN_PROFILE;
+	av1->svtCfg.enc_mode = 13;
+	av1->svtCfg.pred_structure = SVT_AV1_PRED_LOW_DELAY_B;
+	av1->svtCfg.hierarchical_levels = 2;
+	av1->svtCfg.intra_period_length = 63;
+	av1->svtCfg.rate_control_mode = av1_svt_ratecontrol(av1->ratecontrol);
+	av1->svtCfg.qp = 32;
+	av1->svtCfg.target_bit_rate =
+	    (av1->bitrate > (UINT32_MAX / 1000u)) ? UINT32_MAX : av1->bitrate * 1000u;
+	av1->svtCfg.max_bit_rate = 0;
+	av1->svtCfg.look_ahead_distance = 0;
+	av1->svtCfg.enable_tpl_la = 0;
+	av1->svtCfg.enable_tf = 0;
+	av1->svtCfg.enable_dg = 0;
+	av1->svtCfg.startup_mg_size = 0;
+	av1->svtCfg.screen_content_mode = 1;
+	av1->svtCfg.tune = 1;
+
+	err = svt_av1_enc_set_parameter(av1->svt, &av1->svtCfg);
+	if (err != EB_ErrorNone)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_set_parameter: 0x%08" PRIx32, (UINT32)err);
+		svt_av1_enc_deinit_handle(av1->svt);
+		av1->svt = nullptr;
+		return FALSE;
+	}
+
+	err = svt_av1_enc_init(av1->svt);
+	if (err != EB_ErrorNone)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_init: 0x%08" PRIx32, (UINT32)err);
+		svt_av1_enc_deinit_handle(av1->svt);
+		av1->svt = nullptr;
+		return FALSE;
+	}
+
+	av1->svtInitialized = true;
+	return TRUE;
+}
+
+static void av1_svt_uninit(FREERDP_AV1_CONTEXT* av1)
+{
+	WINPR_ASSERT(av1);
+
+	if (!av1->svt)
+		return;
+
+	if (av1->svtInitialized)
+	{
+		const EbErrorType err = svt_av1_enc_deinit(av1->svt);
+		if (err != EB_ErrorNone)
+			WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_deinit: 0x%08" PRIx32, (UINT32)err);
+		av1->svtInitialized = false;
+	}
+
+	const EbErrorType err = svt_av1_enc_deinit_handle(av1->svt);
+	if (err != EB_ErrorNone)
+		WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_deinit_handle: 0x%08" PRIx32, (UINT32)err);
+	av1->svt = nullptr;
+}
+#endif
+
 static void av1_backend_uninit(FREERDP_AV1_CONTEXT* av1)
 {
 	WINPR_ASSERT(av1);
@@ -469,6 +602,11 @@ static void av1_backend_uninit(FREERDP_AV1_CONTEXT* av1)
 #if defined(WITH_LIBAOM)
 		case FREERDP_AV1_BACKEND_AOM:
 			av1_aom_uninit(av1);
+			break;
+#endif
+#if defined(WITH_LIBSVTAV1)
+		case FREERDP_AV1_BACKEND_SVTAV1:
+			av1_svt_uninit(av1);
 			break;
 #endif
 		case FREERDP_AV1_BACKEND_NONE:
@@ -492,6 +630,11 @@ static BOOL av1_backend_init(FREERDP_AV1_CONTEXT* av1, FREERDP_AV1_BACKEND backe
 #if defined(WITH_LIBAOM)
 		case FREERDP_AV1_BACKEND_AOM:
 			rc = av1_aom_init(av1, width, height);
+			break;
+#endif
+#if defined(WITH_LIBSVTAV1)
+		case FREERDP_AV1_BACKEND_SVTAV1:
+			rc = av1_svt_init(av1, width, height);
 			break;
 #endif
 		case FREERDP_AV1_BACKEND_NONE:
@@ -586,8 +729,8 @@ static INT32 av1_aom_compress(FREERDP_AV1_CONTEXT* av1, BYTE** ppDstData, UINT32
 
 WINPR_ATTR_NODISCARD
 static INT32 av1_aom_decompress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, UINT32 SrcSize,
-                                BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep, UINT32 nDstWidth,
-                                UINT32 nDstHeight)
+                                 BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep, UINT32 nDstWidth,
+                                 UINT32 nDstHeight)
 {
 	WINPR_ASSERT(av1);
 
@@ -633,6 +776,85 @@ static INT32 av1_aom_decompress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, 
 	}
 
 	return status;
+}
+#endif
+
+#if defined(WITH_LIBSVTAV1)
+WINPR_ATTR_NODISCARD
+static INT32 av1_svt_compress(FREERDP_AV1_CONTEXT* av1, BYTE** ppDstData, UINT32* pDstSize)
+{
+	WINPR_ASSERT(av1);
+	WINPR_ASSERT(av1->profile == 0);
+
+	av1->svtPicture.luma = av1->yuvdata[0];
+	av1->svtPicture.cb = av1->yuvdata[1];
+	av1->svtPicture.cr = av1->yuvdata[2];
+	av1->svtPicture.y_stride = av1->yuvStride[0];
+	av1->svtPicture.cb_stride = av1->yuvStride[1];
+	av1->svtPicture.cr_stride = av1->yuvStride[2];
+
+	av1->svtInput = (EbBufferHeaderType)WINPR_C_ARRAY_INIT;
+	av1->svtInput.size = sizeof(av1->svtInput);
+	av1->svtInput.p_buffer = (uint8_t*)&av1->svtPicture;
+	av1->svtInput.n_filled_len =
+	    av1->width * av1->height + 2 * (((av1->width + 1) / 2) * ((av1->height + 1) / 2));
+	av1->svtInput.n_alloc_len = av1->svtInput.n_filled_len;
+	av1->svtInput.pts = WINPR_ASSERTING_INT_CAST(int64_t, ++av1->framecount);
+	av1->svtInput.flags = 0;
+
+	EbErrorType err = svt_av1_enc_send_picture(av1->svt, &av1->svtInput);
+	if (err != EB_ErrorNone)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_send_picture: 0x%08" PRIx32, (UINT32)err);
+		goto fail;
+	}
+
+	EbBufferHeaderType eos = WINPR_C_ARRAY_INIT;
+	eos.size = sizeof(eos);
+	eos.flags = EB_BUFFERFLAG_EOS;
+	err = svt_av1_enc_send_picture(av1->svt, &eos);
+	if (err != EB_ErrorNone)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_send_picture(EOS): 0x%08" PRIx32, (UINT32)err);
+		goto fail;
+	}
+
+	while (true)
+	{
+		EbBufferHeaderType* pkt = nullptr;
+		err = svt_av1_enc_get_packet(av1->svt, &pkt, 1);
+		if ((err == EB_NoErrorEmptyQueue) || (err == EB_NoErrorFifoShutdown))
+			break;
+		if (err != EB_ErrorNone)
+		{
+			WLog_Print(av1->log, WLOG_WARN, "svt_av1_enc_get_packet: 0x%08" PRIx32, (UINT32)err);
+			goto fail;
+		}
+
+		if (pkt)
+		{
+			const BOOL eos = (pkt->flags & EB_BUFFERFLAG_EOS) != 0;
+			const BOOL ok = av1_bitstream_append(av1, pkt->p_buffer, pkt->n_filled_len);
+			svt_av1_enc_release_out_buffer(&pkt);
+			if (!ok)
+				goto fail;
+			if (eos)
+				break;
+		}
+	}
+
+	av1_backend_uninit(av1);
+
+	if (av1->bitstreamSize == 0)
+		return 0;
+
+	*ppDstData = av1->bitstream;
+	*pDstSize = av1->bitstreamSize;
+	return 1;
+
+fail:
+	av1_backend_uninit(av1);
+	return -1;
 }
 #endif
 
@@ -744,6 +966,11 @@ INT32 freerdp_av1_compress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, DWORD
 #if defined(WITH_LIBAOM)
 		case FREERDP_AV1_BACKEND_AOM:
 			rc = av1_aom_compress(av1, ppDstData, pDstSize);
+			break;
+#endif
+#if defined(WITH_LIBSVTAV1)
+		case FREERDP_AV1_BACKEND_SVTAV1:
+			rc = av1_svt_compress(av1, ppDstData, pDstSize);
 			break;
 #endif
 		case FREERDP_AV1_BACKEND_NONE:

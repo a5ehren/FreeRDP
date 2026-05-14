@@ -6,7 +6,7 @@
 #include <freerdp/codec/color.h>
 #include <freerdp/codec/h264.h>
 
-#if defined(WITH_LIBAOM)
+#if defined(WITH_LIBAOM) || defined(WITH_LIBSVTAV1)
 #define HAVE_AV1_I420_ENCODER 1
 #endif
 

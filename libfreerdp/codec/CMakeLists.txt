@@ -120,6 +120,13 @@ if(WITH_AOM AND AOM_FOUND)
   freerdp_pc_add_requires_private("aom")
 endif()
 
+if(WITH_SVTAV1 AND SVTAV1_FOUND)
+  add_compile_definitions(WITH_LIBSVTAV1)
+  list(APPEND CODEC_LIBS ${SVTAV1_LIBRARIES})
+  include_directories(SYSTEM ${SVTAV1_INCLUDE_DIRS})
+  freerdp_pc_add_requires_private("SvtAv1Enc")
+endif()
+
 if(WITH_YUV AND YUV_FOUND)
   add_compile_definitions(WITH_LIBYUV)
   list(APPEND CODEC_LIBS ${YUV_LIBRARIES})
