@@ -41,6 +41,14 @@
 #include <EbSvtAv1Enc.h>
 #endif
 
+#if defined(WITH_LIBDAV1D)
+#include <errno.h>
+
+#include <dav1d/dav1d.h>
+#include <dav1d/data.h>
+#include <dav1d/picture.h>
+#endif
+
 #if defined(WITH_LIBYUV)
 #include <libyuv.h>
 #endif
@@ -51,7 +59,8 @@ typedef enum
 {
 	FREERDP_AV1_BACKEND_NONE,
 	FREERDP_AV1_BACKEND_AOM,
-	FREERDP_AV1_BACKEND_SVTAV1
+	FREERDP_AV1_BACKEND_SVTAV1,
+	FREERDP_AV1_BACKEND_DAV1D
 } FREERDP_AV1_BACKEND;
 
 struct S_FREERDP_AV1_CONTEXT
@@ -93,6 +102,9 @@ struct S_FREERDP_AV1_CONTEXT
 	EbSvtIOFormat svtPicture;
 #endif
 
+#if defined(WITH_LIBDAV1D)
+	Dav1dContext* dav1d;
+#endif
 };
 
 WINPR_ATTR_NODISCARD
@@ -137,14 +149,16 @@ WINPR_ATTR_NODISCARD
 static const char* av1_backend_name(FREERDP_AV1_BACKEND backend)
 {
 	switch (backend)
-		{
-			case FREERDP_AV1_BACKEND_AOM:
-				return "libaom";
-			case FREERDP_AV1_BACKEND_SVTAV1:
-				return "SVT-AV1";
-			case FREERDP_AV1_BACKEND_NONE:
-			default:
-				return "none";
+	{
+		case FREERDP_AV1_BACKEND_AOM:
+			return "libaom";
+		case FREERDP_AV1_BACKEND_SVTAV1:
+			return "SVT-AV1";
+		case FREERDP_AV1_BACKEND_DAV1D:
+			return "dav1d";
+		case FREERDP_AV1_BACKEND_NONE:
+		default:
+			return "none";
 	}
 }
 
@@ -398,7 +412,9 @@ static FREERDP_AV1_BACKEND av1_select_backend(const FREERDP_AV1_CONTEXT* av1)
 		}
 	}
 
-#if defined(WITH_LIBAOM)
+#if defined(WITH_LIBDAV1D)
+	return FREERDP_AV1_BACKEND_DAV1D;
+#elif defined(WITH_LIBAOM)
 	return FREERDP_AV1_BACKEND_AOM;
 #else
 	return FREERDP_AV1_BACKEND_NONE;
@@ -419,8 +435,15 @@ static FREERDP_AV1_BACKEND av1_fallback_backend(const FREERDP_AV1_CONTEXT* av1,
 			return FREERDP_AV1_BACKEND_AOM;
 #endif
 		}
+		return FREERDP_AV1_BACKEND_NONE;
 	}
 
+	if (failed == FREERDP_AV1_BACKEND_DAV1D)
+	{
+#if defined(WITH_LIBAOM)
+		return FREERDP_AV1_BACKEND_AOM;
+#endif
+	}
 	return FREERDP_AV1_BACKEND_NONE;
 }
 
@@ -590,6 +613,37 @@ static void av1_svt_uninit(FREERDP_AV1_CONTEXT* av1)
 }
 #endif
 
+#if defined(WITH_LIBDAV1D)
+WINPR_ATTR_NODISCARD
+static BOOL av1_dav1d_init(FREERDP_AV1_CONTEXT* av1)
+{
+	WINPR_ASSERT(av1);
+	WINPR_ASSERT(!av1->encoder);
+
+	Dav1dSettings settings = WINPR_C_ARRAY_INIT;
+	dav1d_default_settings(&settings);
+	settings.n_threads = 1;
+	settings.max_frame_delay = 1;
+	settings.apply_grain = 0;
+
+	const int rc = dav1d_open(&av1->dav1d, &settings);
+	if (rc < 0)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "dav1d_open: %d", rc);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static void av1_dav1d_uninit(FREERDP_AV1_CONTEXT* av1)
+{
+	WINPR_ASSERT(av1);
+
+	if (av1->dav1d)
+		dav1d_close(&av1->dav1d);
+}
+#endif
+
 static void av1_backend_uninit(FREERDP_AV1_CONTEXT* av1)
 {
 	WINPR_ASSERT(av1);
@@ -607,6 +661,11 @@ static void av1_backend_uninit(FREERDP_AV1_CONTEXT* av1)
 #if defined(WITH_LIBSVTAV1)
 		case FREERDP_AV1_BACKEND_SVTAV1:
 			av1_svt_uninit(av1);
+			break;
+#endif
+#if defined(WITH_LIBDAV1D)
+		case FREERDP_AV1_BACKEND_DAV1D:
+			av1_dav1d_uninit(av1);
 			break;
 #endif
 		case FREERDP_AV1_BACKEND_NONE:
@@ -635,6 +694,11 @@ static BOOL av1_backend_init(FREERDP_AV1_CONTEXT* av1, FREERDP_AV1_BACKEND backe
 #if defined(WITH_LIBSVTAV1)
 		case FREERDP_AV1_BACKEND_SVTAV1:
 			rc = av1_svt_init(av1, width, height);
+			break;
+#endif
+#if defined(WITH_LIBDAV1D)
+		case FREERDP_AV1_BACKEND_DAV1D:
+			rc = av1_dav1d_init(av1);
 			break;
 #endif
 		case FREERDP_AV1_BACKEND_NONE:
@@ -729,8 +793,8 @@ static INT32 av1_aom_compress(FREERDP_AV1_CONTEXT* av1, BYTE** ppDstData, UINT32
 
 WINPR_ATTR_NODISCARD
 static INT32 av1_aom_decompress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, UINT32 SrcSize,
-                                 BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep, UINT32 nDstWidth,
-                                 UINT32 nDstHeight)
+                                BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep, UINT32 nDstWidth,
+                                UINT32 nDstHeight)
 {
 	WINPR_ASSERT(av1);
 
@@ -858,8 +922,121 @@ fail:
 }
 #endif
 
+#if defined(WITH_LIBDAV1D)
+WINPR_ATTR_NODISCARD
+static INT32 av1_dav1d_output_picture(FREERDP_AV1_CONTEXT* av1, const Dav1dPicture* picture,
+                                      BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep,
+                                      UINT32 nDstWidth, UINT32 nDstHeight)
+{
+	WINPR_ASSERT(av1);
+	WINPR_ASSERT(picture);
+
+	if ((picture->p.bpc != 8) || (picture->p.w != WINPR_ASSERTING_INT_CAST(int, nDstWidth)) ||
+	    (picture->p.h != WINPR_ASSERTING_INT_CAST(int, nDstHeight)))
+	{
+		WLog_Print(av1->log, WLOG_ERROR,
+		           "dav1d picture format mismatch: %dx%d %dbpc, expected %" PRIu32 "x%" PRIu32
+		           " 8bpc",
+		           picture->p.w, picture->p.h, picture->p.bpc, nDstWidth, nDstHeight);
+		return -1;
+	}
+
+	UINT32 profile = UINT32_MAX;
+	switch (picture->p.layout)
+	{
+		case DAV1D_PIXEL_LAYOUT_I420:
+			profile = 0;
+			break;
+		case DAV1D_PIXEL_LAYOUT_I444:
+			profile = 1;
+			break;
+		default:
+			WLog_Print(av1->log, WLOG_ERROR, "dav1d layout %d not supported", picture->p.layout);
+			return -1;
+	}
+
+	if ((picture->stride[0] < 0) || (picture->stride[1] < 0) || (picture->stride[0] > UINT32_MAX) ||
+	    (picture->stride[1] > UINT32_MAX))
+	{
+		WLog_Print(av1->log, WLOG_ERROR, "dav1d returned invalid strides");
+		return -1;
+	}
+
+	const BYTE* pSrc[] = { picture->data[0], picture->data[1], picture->data[2] };
+	const UINT32 strides[] = { (UINT32)picture->stride[0], (UINT32)picture->stride[1],
+		                       (UINT32)picture->stride[1] };
+
+	const pstatus_t rec = av1_convert_yuv_to_rgb(av1, profile, pSrc, strides, pDstData, DstFormat,
+	                                             nDstStep, nDstWidth, nDstHeight);
+	if (rec != 0)
+	{
+		WLog_Print(av1->log, WLOG_ERROR, "AV1 YUV to RGB conversion failed: %d", rec);
+		return -1;
+	}
+	return 1;
+}
+
+WINPR_ATTR_NODISCARD
+static INT32 av1_dav1d_decompress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, UINT32 SrcSize,
+                                  BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep,
+                                  UINT32 nDstWidth, UINT32 nDstHeight)
+{
+	WINPR_ASSERT(av1);
+
+	Dav1dData data = WINPR_C_ARRAY_INIT;
+	uint8_t* buffer = dav1d_data_create(&data, SrcSize);
+	if (!buffer)
+	{
+		WLog_Print(av1->log, WLOG_ERROR, "dav1d_data_create failed");
+		return -1;
+	}
+	memcpy(buffer, pSrcData, SrcSize);
+
+	INT32 status = 0;
+	do
+	{
+		int rc = dav1d_send_data(av1->dav1d, &data);
+		if ((rc < 0) && (rc != DAV1D_ERR(EAGAIN)))
+		{
+			WLog_Print(av1->log, WLOG_WARN, "dav1d_send_data: %d", rc);
+			dav1d_data_unref(&data);
+			return -1;
+		}
+
+		while (true)
+		{
+			Dav1dPicture picture = WINPR_C_ARRAY_INIT;
+			rc = dav1d_get_picture(av1->dav1d, &picture);
+			if (rc == DAV1D_ERR(EAGAIN))
+				break;
+			if (rc < 0)
+			{
+				WLog_Print(av1->log, WLOG_WARN, "dav1d_get_picture: %d", rc);
+				dav1d_data_unref(&data);
+				return -1;
+			}
+
+			const INT32 converted = av1_dav1d_output_picture(av1, &picture, pDstData, DstFormat,
+			                                                 nDstStep, nDstWidth, nDstHeight);
+			dav1d_picture_unref(&picture);
+			if (converted < 0)
+			{
+				dav1d_data_unref(&data);
+				return -1;
+			}
+			status = converted;
+		}
+
+		if ((rc == DAV1D_ERR(EAGAIN)) && (data.sz > 0))
+			continue;
+	} while (data.sz > 0);
+
+	return status;
+}
+#endif
+
 BOOL freerdp_av1_context_set_option(FREERDP_AV1_CONTEXT* av1, FREERDP_AV1_CONTEXT_OPTION option,
-                                     UINT32 value)
+                                    UINT32 value)
 {
 	WINPR_ASSERT(av1);
 
@@ -1016,6 +1193,11 @@ INT32 freerdp_av1_decompress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, UIN
 		case FREERDP_AV1_BACKEND_AOM:
 			return av1_aom_decompress(av1, pSrcData, SrcSize, pDstData, DstFormat, nDstStep,
 			                          nDstWidth, nDstHeight);
+#endif
+#if defined(WITH_LIBDAV1D)
+		case FREERDP_AV1_BACKEND_DAV1D:
+			return av1_dav1d_decompress(av1, pSrcData, SrcSize, pDstData, DstFormat, nDstStep,
+			                            nDstWidth, nDstHeight);
 #endif
 		case FREERDP_AV1_BACKEND_NONE:
 		default:

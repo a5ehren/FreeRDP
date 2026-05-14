@@ -14,7 +14,7 @@
 #define HAVE_AV1_I444_ENCODER 1
 #endif
 
-#if defined(WITH_LIBAOM)
+#if defined(WITH_LIBAOM) || defined(WITH_LIBDAV1D)
 #define HAVE_AV1_DECODER 1
 #endif
 
