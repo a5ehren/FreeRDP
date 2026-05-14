@@ -19,10 +19,11 @@
  */
 
 #include <freerdp/codec/av1.h>
-#include <freerdp/primitives.h>
 #include <freerdp/log.h>
+#include <freerdp/primitives.h>
 
-#define TAG FREERDP_TAG("codec.av1")
+#include <winpr/assert.h>
+#include <winpr/crt.h>
 
 #if defined(WITH_LIBAOM)
 #include <aom/aom.h>
@@ -33,27 +34,51 @@
 #include <aom/aom_image.h>
 #include <aom/aomcx.h>
 #include <aom/aomdx.h>
+#endif
 
 #if defined(WITH_LIBYUV)
 #include <libyuv.h>
 #endif
 
+#define TAG FREERDP_TAG("codec.av1")
+
+typedef enum
+{
+	FREERDP_AV1_BACKEND_NONE,
+	FREERDP_AV1_BACKEND_AOM
+} FREERDP_AV1_BACKEND;
+
 struct S_FREERDP_AV1_CONTEXT
 {
-	aom_codec_ctx_t ctx;
 	wLog* log;
 	bool encoder;
 	bool initialized;
-	aom_codec_enc_cfg_t ecfg;
-	aom_codec_dec_cfg_t dcfg;
-	aom_codec_pts_t framecount;
-	aom_enc_frame_flags_t eflags;
-	aom_codec_flags_t flags;
-	aom_codec_iface_t* iface;
+	FREERDP_AV1_BACKEND backend;
+
+	UINT32 profile;
+	UINT32 ratecontrol;
+	UINT32 bitrate;
+	UINT32 usagetype;
+	UINT32 width;
+	UINT32 height;
+	UINT64 framecount;
+
 	BYTE* yuvdata[3];
-	UINT32 yuvWidth;
 	UINT32 yuvStride[3];
-	UINT32 yuvHeight;
+	UINT32 yuvHeight[3];
+
+	BYTE* bitstream;
+	UINT32 bitstreamSize;
+	UINT32 bitstreamCapacity;
+
+#if defined(WITH_LIBAOM)
+	aom_codec_ctx_t aom;
+	aom_codec_enc_cfg_t aomEcfg;
+	aom_codec_dec_cfg_t aomDcfg;
+	aom_enc_frame_flags_t aomEflags;
+	aom_codec_flags_t aomFlags;
+#endif
+
 };
 
 WINPR_ATTR_NODISCARD
@@ -61,7 +86,7 @@ static BOOL allocate_h264_metablock(UINT32 QP, RECTANGLE_16* rectangles,
                                     RDPGFX_H264_METABLOCK* meta, size_t count)
 {
 	/* [MS-RDPEGFX] 2.2.4.4.2 RDPGFX_AVC420_QUANT_QUALITY */
-	if (!meta || (QP > UINT8_MAX))
+	if (!meta || (QP > UINT8_MAX) || (count > UINT32_MAX))
 	{
 		free(rectangles);
 		return FALSE;
@@ -71,13 +96,16 @@ static BOOL allocate_h264_metablock(UINT32 QP, RECTANGLE_16* rectangles,
 	if (count == 0)
 		return TRUE;
 
-	if (count > UINT32_MAX)
-		return FALSE;
-
 	meta->quantQualityVals = calloc(count, sizeof(RDPGFX_H264_QUANT_QUALITY));
 
 	if (!meta->quantQualityVals || !meta->regionRects)
+	{
+		free(meta->quantQualityVals);
+		free(meta->regionRects);
+		*meta = (RDPGFX_H264_METABLOCK)WINPR_C_ARRAY_INIT;
 		return FALSE;
+	}
+
 	meta->numRegionRects = (UINT32)count;
 	for (size_t x = 0; x < count; x++)
 	{
@@ -91,76 +119,576 @@ static BOOL allocate_h264_metablock(UINT32 QP, RECTANGLE_16* rectangles,
 	return TRUE;
 }
 
-BOOL freerdp_av1_context_set_option(FREERDP_AV1_CONTEXT* av1, FREERDP_AV1_CONTEXT_OPTION option,
-                                    UINT32 value)
+WINPR_ATTR_NODISCARD
+static const char* av1_backend_name(FREERDP_AV1_BACKEND backend)
 {
+	switch (backend)
+	{
+		case FREERDP_AV1_BACKEND_AOM:
+			return "libaom";
+		case FREERDP_AV1_BACKEND_NONE:
+		default:
+			return "none";
+	}
+}
+
+WINPR_ATTR_NODISCARD
+static UINT32 av1_default_usage(void)
+{
+#if defined(WITH_LIBAOM)
+	return AOM_USAGE_REALTIME;
+#else
+	return 1;
+#endif
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL av1_validate_ratecontrol(FREERDP_AV1_CONTEXT* av1, UINT32 value)
+{
+	switch (value)
+	{
+		case FREERDP_AV1_VBR:
+		case FREERDP_AV1_CBR:
+		case FREERDP_AV1_CQ:
+		case FREERDP_AV1_Q:
+			return TRUE;
+		default:
+			WLog_Print(av1->log, WLOG_WARN,
+			           "Unknown FREERDP_AV1_CONTEXT_OPTION_RATECONTROL value [0x%08" PRIx32 "]",
+			           value);
+			return FALSE;
+	}
+}
+
+static void av1_free_yuv(FREERDP_AV1_CONTEXT* av1)
+{
+	for (size_t x = 0; x < ARRAYSIZE(av1->yuvdata); x++)
+	{
+		winpr_aligned_free(av1->yuvdata[x]);
+		av1->yuvdata[x] = nullptr;
+		av1->yuvStride[x] = 0;
+		av1->yuvHeight[x] = 0;
+	}
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL av1_allocate_yuv(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
+{
+	WINPR_ASSERT(av1);
+
+	const BOOL i420 = av1->profile == 0;
+	UINT32 strides[3] = { width, i420 ? (width + 1) / 2 : width, i420 ? (width + 1) / 2 : width };
+	const UINT32 heights[3] = { height, i420 ? (height + 1) / 2 : height,
+		                        i420 ? (height + 1) / 2 : height };
+
+	for (size_t x = 0; x < ARRAYSIZE(strides); x++)
+	{
+		if (strides[x] % 16 != 0)
+			strides[x] += 16 - (strides[x] % 16);
+	}
+
+	BYTE* data[3] = WINPR_C_ARRAY_INIT;
+	for (size_t x = 0; x < ARRAYSIZE(data); x++)
+	{
+		if ((strides[x] == 0) || (heights[x] == 0))
+			goto fail;
+
+		data[x] = winpr_aligned_malloc(1ull * strides[x] * heights[x], 64);
+		if (!data[x])
+			goto fail;
+	}
+
+	av1_free_yuv(av1);
+	for (size_t x = 0; x < ARRAYSIZE(data); x++)
+	{
+		av1->yuvdata[x] = data[x];
+		av1->yuvStride[x] = strides[x];
+		av1->yuvHeight[x] = heights[x];
+	}
+	return TRUE;
+
+fail:
+	for (size_t x = 0; x < ARRAYSIZE(data); x++)
+		winpr_aligned_free(data[x]);
+	return FALSE;
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL av1_bitstream_reserve(FREERDP_AV1_CONTEXT* av1, size_t size)
+{
+	WINPR_ASSERT(av1);
+
+	if (size > UINT32_MAX)
+		return FALSE;
+	if (size <= av1->bitstreamCapacity)
+		return TRUE;
+
+	BYTE* tmp = realloc(av1->bitstream, size);
+	if (!tmp)
+		return FALSE;
+	av1->bitstream = tmp;
+	av1->bitstreamCapacity = (UINT32)size;
+	return TRUE;
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL av1_bitstream_append(FREERDP_AV1_CONTEXT* av1, const BYTE* data, size_t size)
+{
+	WINPR_ASSERT(av1);
+
+	if (size == 0)
+		return TRUE;
+	if (!data)
+		return FALSE;
+
+	const size_t oldSize = av1->bitstreamSize;
+	const size_t newSize = oldSize + size;
+	if ((newSize < oldSize) || !av1_bitstream_reserve(av1, newSize))
+		return FALSE;
+
+	memcpy(&av1->bitstream[oldSize], data, size);
+	av1->bitstreamSize = (UINT32)newSize;
+	return TRUE;
+}
+
+WINPR_ATTR_NODISCARD
+static pstatus_t av1_convert_rgb_to_yuv(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData,
+                                        DWORD SrcFormat, UINT32 nSrcStep, UINT32 width,
+                                        UINT32 height)
+{
+	WINPR_ASSERT(av1);
+	WINPR_ASSERT(pSrcData);
+
+	const prim_size_t roi = { .width = width, .height = height };
+
+#if defined(WITH_LIBYUV)
+	WINPR_UNUSED(SrcFormat);
+	switch (av1->profile)
+	{
+		case 0:
+			return ARGBToI420(pSrcData, nSrcStep, av1->yuvdata[0], av1->yuvStride[0],
+			                  av1->yuvdata[1], av1->yuvStride[1], av1->yuvdata[2],
+			                  WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[2]),
+			                  WINPR_ASSERTING_INT_CAST(int, roi.width),
+			                  WINPR_ASSERTING_INT_CAST(int, roi.height));
+		case 1:
+			return ARGBToI444(pSrcData, nSrcStep, av1->yuvdata[0], av1->yuvStride[0],
+			                  av1->yuvdata[1], av1->yuvStride[1], av1->yuvdata[2],
+			                  WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[2]),
+			                  WINPR_ASSERTING_INT_CAST(int, roi.width),
+			                  WINPR_ASSERTING_INT_CAST(int, roi.height));
+		default:
+			WLog_Print(av1->log, WLOG_ERROR, "Unsupported AV1 profile %" PRIu32, av1->profile);
+			return -1;
+	}
+#else
+	primitives_t* primitives = primitives_get();
+	if (!primitives)
+	{
+		WLog_Print(av1->log, WLOG_ERROR, "primitives_get(): nullptr");
+		return -1;
+	}
+
+	switch (av1->profile)
+	{
+		case 0:
+			return primitives->RGBToYUV420_8u_P3AC4R(pSrcData, SrcFormat, nSrcStep, av1->yuvdata,
+			                                         av1->yuvStride, &roi);
+		case 1:
+			return primitives->RGBToI444_8u(pSrcData, SrcFormat, nSrcStep, av1->yuvdata,
+			                                av1->yuvStride, &roi);
+		default:
+			WLog_Print(av1->log, WLOG_ERROR, "Unsupported AV1 profile %" PRIu32, av1->profile);
+			return -1;
+	}
+#endif
+}
+
+WINPR_ATTR_NODISCARD
+static pstatus_t av1_convert_yuv_to_rgb(FREERDP_AV1_CONTEXT* av1, UINT32 profile,
+                                        const BYTE* planes[3], const UINT32 strides[3],
+                                        BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep,
+                                        UINT32 width, UINT32 height)
+{
+	WINPR_ASSERT(av1);
+	WINPR_ASSERT(planes);
+	WINPR_ASSERT(strides);
+	WINPR_ASSERT(pDstData);
+
+#if defined(WITH_LIBYUV)
+	WINPR_UNUSED(DstFormat);
+	switch (profile)
+	{
+		case 0:
+			return J420ToARGB(planes[0], strides[0], planes[1], strides[1], planes[2], strides[2],
+			                  pDstData, nDstStep, width, height);
+		case 1:
+			return J444ToARGB(planes[0], strides[0], planes[1], strides[1], planes[2], strides[2],
+			                  pDstData, nDstStep, width, height);
+		default:
+			WLog_Print(av1->log, WLOG_ERROR, "Unsupported AV1 profile %" PRIu32, profile);
+			return -1;
+	}
+#else
+	primitives_t* primitives = primitives_get();
+	if (!primitives)
+	{
+		WLog_Print(av1->log, WLOG_ERROR, "primitives_get(): nullptr");
+		return -1;
+	}
+
+	const prim_size_t roi = { .width = width, .height = height };
+
+	switch (profile)
+	{
+		case 0:
+			return primitives->YUV420ToRGB_8u_P3AC4R(planes, strides, pDstData, nDstStep, DstFormat,
+			                                         &roi);
+		case 1:
+			return primitives->YUV444ToRGB_8u_P3AC4R(planes, strides, pDstData, nDstStep, DstFormat,
+			                                         &roi);
+		default:
+			WLog_Print(av1->log, WLOG_ERROR, "Unsupported AV1 profile %" PRIu32, profile);
+			return -1;
+	}
+#endif
+}
+
+WINPR_ATTR_NODISCARD
+static FREERDP_AV1_BACKEND av1_select_backend(const FREERDP_AV1_CONTEXT* av1)
+{
+	WINPR_ASSERT(av1);
+
+	if (av1->encoder)
+	{
+		switch (av1->profile)
+		{
+			case 0:
+			case 1:
+#if defined(WITH_LIBAOM)
+				return FREERDP_AV1_BACKEND_AOM;
+#else
+				return FREERDP_AV1_BACKEND_NONE;
+#endif
+			default:
+				return FREERDP_AV1_BACKEND_NONE;
+		}
+	}
+
+#if defined(WITH_LIBAOM)
+	return FREERDP_AV1_BACKEND_AOM;
+#else
+	return FREERDP_AV1_BACKEND_NONE;
+#endif
+}
+
+WINPR_ATTR_NODISCARD
+static FREERDP_AV1_BACKEND av1_fallback_backend(const FREERDP_AV1_CONTEXT* av1,
+                                                FREERDP_AV1_BACKEND failed)
+{
+	WINPR_ASSERT(av1);
+	WINPR_UNUSED(failed);
+	return FREERDP_AV1_BACKEND_NONE;
+}
+
+#if defined(WITH_LIBAOM)
+WINPR_ATTR_NODISCARD
+static BOOL av1_aom_init(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
+{
+	WINPR_ASSERT(av1);
+
+	aom_codec_iface_t* iface = av1->encoder ? aom_codec_av1_cx() : aom_codec_av1_dx();
+	if (!iface)
+	{
+		WLog_Print(av1->log, WLOG_ERROR, "aom_codec_av1_%s() nullptr", av1->encoder ? "cx" : "dx");
+		return FALSE;
+	}
+
+	if (av1->encoder)
+	{
+		aom_codec_err_t rc = aom_codec_enc_config_default(iface, &av1->aomEcfg, av1->usagetype);
+		if (rc != AOM_CODEC_OK)
+		{
+			WLog_Print(av1->log, WLOG_ERROR, "aom_codec_enc_config_default() %s",
+			           aom_codec_err_to_string(rc));
+			return FALSE;
+		}
+
+		av1->aomEcfg.g_w = width;
+		av1->aomEcfg.g_h = height;
+		av1->aomEcfg.g_profile = av1->profile;
+		av1->aomEcfg.rc_end_usage = av1->ratecontrol;
+		av1->aomEcfg.rc_target_bitrate = av1->bitrate;
+
+		rc = aom_codec_enc_init(&av1->aom, iface, &av1->aomEcfg, av1->aomFlags);
+		if (rc != AOM_CODEC_OK)
+		{
+			WLog_Print(av1->log, WLOG_WARN, "aom_codec_enc_init: %s", aom_codec_err_to_string(rc));
+			return FALSE;
+		}
+
+		av1->aomEflags = 0;
+	}
+	else
+	{
+		av1->aomDcfg.w = width;
+		av1->aomDcfg.h = height;
+		av1->aomDcfg.allow_lowbitdepth = 1;
+
+		const aom_codec_err_t rc =
+		    aom_codec_dec_init(&av1->aom, iface, &av1->aomDcfg, av1->aomFlags);
+		if (rc != AOM_CODEC_OK)
+		{
+			WLog_Print(av1->log, WLOG_WARN, "aom_codec_dec_init: %s", aom_codec_err_to_string(rc));
+			return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
+static void av1_aom_uninit(FREERDP_AV1_CONTEXT* av1)
+{
+	WINPR_ASSERT(av1);
+
+	const aom_codec_err_t rc = aom_codec_destroy(&av1->aom);
+	if (rc != AOM_CODEC_OK)
+		WLog_Print(av1->log, WLOG_WARN, "aom_codec_destroy: %s", aom_codec_err_to_string(rc));
+}
+#endif
+
+static void av1_backend_uninit(FREERDP_AV1_CONTEXT* av1)
+{
+	WINPR_ASSERT(av1);
+
+	if (!av1->initialized)
+		return;
+
+	switch (av1->backend)
+	{
+#if defined(WITH_LIBAOM)
+		case FREERDP_AV1_BACKEND_AOM:
+			av1_aom_uninit(av1);
+			break;
+#endif
+		case FREERDP_AV1_BACKEND_NONE:
+		default:
+			break;
+	}
+
+	av1->backend = FREERDP_AV1_BACKEND_NONE;
+	av1->initialized = false;
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL av1_backend_init(FREERDP_AV1_CONTEXT* av1, FREERDP_AV1_BACKEND backend, UINT32 width,
+                             UINT32 height)
+{
+	WINPR_ASSERT(av1);
+
+	BOOL rc = FALSE;
+	switch (backend)
+	{
+#if defined(WITH_LIBAOM)
+		case FREERDP_AV1_BACKEND_AOM:
+			rc = av1_aom_init(av1, width, height);
+			break;
+#endif
+		case FREERDP_AV1_BACKEND_NONE:
+		default:
+			break;
+	}
+
+	if (rc)
+	{
+		av1->backend = backend;
+		av1->initialized = true;
+	}
+	return rc;
+}
+
+WINPR_ATTR_NODISCARD
+static BOOL av1_reinit_backend(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
+{
+	WINPR_ASSERT(av1);
+
+	av1_backend_uninit(av1);
+
+	FREERDP_AV1_BACKEND backend = av1_select_backend(av1);
+	if (backend == FREERDP_AV1_BACKEND_NONE)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "No AV1 %s backend available for profile %" PRIu32,
+		           av1->encoder ? "encoder" : "decoder", av1->profile);
+		return FALSE;
+	}
+
+	if (av1_backend_init(av1, backend, width, height))
+		return TRUE;
+
+	const FREERDP_AV1_BACKEND fallback = av1_fallback_backend(av1, backend);
+	if (fallback == FREERDP_AV1_BACKEND_NONE)
+		return FALSE;
+
+	WLog_Print(av1->log, WLOG_WARN, "Falling back from AV1 %s backend to %s",
+	           av1_backend_name(backend), av1_backend_name(fallback));
+	av1_backend_uninit(av1);
+	return av1_backend_init(av1, fallback, width, height);
+}
+
+#if defined(WITH_LIBAOM)
+WINPR_ATTR_NODISCARD
+static INT32 av1_aom_compress(FREERDP_AV1_CONTEXT* av1, BYTE** ppDstData, UINT32* pDstSize)
+{
+	WINPR_ASSERT(av1);
+
+	aom_image_t img = WINPR_C_ARRAY_INIT;
+	img.fmt = (av1->profile == 0) ? AOM_IMG_FMT_I420 : AOM_IMG_FMT_I444;
+	img.bit_depth = 8;
+	img.d_w = img.r_w = img.w = av1->width;
+	img.d_h = img.r_h = img.h = av1->height;
+	if (av1->profile == 0)
+	{
+		img.x_chroma_shift = 1;
+		img.y_chroma_shift = 1;
+	}
+	img.stride[0] = WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[0]);
+	img.stride[1] = WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[1]);
+	img.stride[2] = WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[2]);
+	img.planes[0] = av1->yuvdata[0];
+	img.planes[1] = av1->yuvdata[1];
+	img.planes[2] = av1->yuvdata[2];
+
+	const aom_codec_err_t rc =
+	    aom_codec_encode(&av1->aom, &img, ++av1->framecount, 1, av1->aomEflags);
+	if (rc != AOM_CODEC_OK)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "aom_codec_encode: %s", aom_codec_err_to_string(rc));
+		return -1;
+	}
+
+	aom_codec_iter_t iter = nullptr;
+	const aom_codec_cx_pkt_t* pkt = nullptr;
+	while ((pkt = aom_codec_get_cx_data(&av1->aom, &iter)) != nullptr)
+	{
+		if (pkt->kind != AOM_CODEC_CX_FRAME_PKT)
+			continue;
+		if (!av1_bitstream_append(av1, pkt->data.frame.buf, pkt->data.frame.sz))
+			return -1;
+	}
+
+	if (av1->bitstreamSize == 0)
+		return 0;
+
+	*ppDstData = av1->bitstream;
+	*pDstSize = av1->bitstreamSize;
+	return 1;
+}
+
+WINPR_ATTR_NODISCARD
+static INT32 av1_aom_decompress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, UINT32 SrcSize,
+                                BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep, UINT32 nDstWidth,
+                                UINT32 nDstHeight)
+{
+	WINPR_ASSERT(av1);
+
+	const aom_codec_err_t rc = aom_codec_decode(&av1->aom, pSrcData, SrcSize, nullptr);
+	if (rc != AOM_CODEC_OK)
+	{
+		WLog_Print(av1->log, WLOG_WARN, "aom_codec_decode: %s", aom_codec_err_to_string(rc));
+		return -1;
+	}
+
+	INT32 status = 0;
+	aom_image_t* img = nullptr;
+	aom_codec_iter_t iter = nullptr;
+	while ((img = aom_codec_get_frame(&av1->aom, &iter)) != nullptr)
+	{
+		UINT32 profile = UINT32_MAX;
+		switch (img->fmt)
+		{
+			case AOM_IMG_FMT_I420:
+				profile = 0;
+				break;
+			case AOM_IMG_FMT_I444:
+				profile = 1;
+				break;
+			default:
+				WLog_Print(av1->log, WLOG_ERROR, "img->fmt %d not supported", img->fmt);
+				return -1;
+		}
+
+		const BYTE* pSrc[] = { img->planes[0], img->planes[1], img->planes[2] };
+		const UINT32 strides[] = { WINPR_ASSERTING_INT_CAST(UINT32, img->stride[0]),
+			                       WINPR_ASSERTING_INT_CAST(UINT32, img->stride[1]),
+			                       WINPR_ASSERTING_INT_CAST(UINT32, img->stride[2]) };
+
+		const pstatus_t rec = av1_convert_yuv_to_rgb(av1, profile, pSrc, strides, pDstData,
+		                                             DstFormat, nDstStep, nDstWidth, nDstHeight);
+		if (rec != 0)
+		{
+			WLog_Print(av1->log, WLOG_ERROR, "AV1 YUV to RGB conversion failed: %d", rec);
+			return -1;
+		}
+		status = 1;
+	}
+
+	return status;
+}
+#endif
+
+BOOL freerdp_av1_context_set_option(FREERDP_AV1_CONTEXT* av1, FREERDP_AV1_CONTEXT_OPTION option,
+                                     UINT32 value)
+{
+	WINPR_ASSERT(av1);
+
+	if (!av1->encoder)
+		return FALSE;
 
 	switch (option)
 	{
 		case FREERDP_AV1_CONTEXT_OPTION_PROFILE:
-			if (!av1->encoder)
-				return FALSE;
-
-			av1->ecfg.g_profile = value;
+			av1->profile = value;
 			break;
-
 		case FREERDP_AV1_CONTEXT_OPTION_RATECONTROL:
-			if (!av1->encoder)
+			if (!av1_validate_ratecontrol(av1, value))
 				return FALSE;
-			switch (value)
-			{
-				case FREERDP_AV1_VBR:
-				case FREERDP_AV1_CBR:
-				case FREERDP_AV1_CQ:
-				case FREERDP_AV1_Q:
-					break;
-				default:
-					WLog_Print(av1->log, WLOG_WARN,
-					           "Unknown FREERDP_AV1_CONTEXT_OPTION_RATECONTROL value [0x%08" PRIx32
-					           "]",
-					           value);
-					return FALSE;
-			}
-			av1->ecfg.rc_end_usage = value;
+			av1->ratecontrol = value;
 			break;
 		case FREERDP_AV1_CONTEXT_OPTION_BITRATE:
-			if (!av1->encoder)
-				return FALSE;
-			av1->ecfg.rc_target_bitrate = value;
+			av1->bitrate = value;
 			break;
 		case FREERDP_AV1_CONTEXT_OPTION_USAGETYPE:
-			if (!av1->encoder)
-				return FALSE;
-			av1->ecfg.g_usage = value;
+			av1->usagetype = value;
 			break;
 		default:
 			WLog_Print(av1->log, WLOG_ERROR, "Unknown FREERDP_AV1_CONTEXT_OPTION[0x%08" PRIx32 "]",
 			           option);
-			return TRUE;
+			return FALSE;
 	}
-	return freerdp_av1_context_reset(av1, av1->ecfg.g_w, av1->ecfg.g_h);
+
+	if ((av1->width == 0) || (av1->height == 0))
+		return TRUE;
+
+	return freerdp_av1_context_reset(av1, av1->width, av1->height);
 }
 
 UINT32 freerdp_av1_context_get_option(FREERDP_AV1_CONTEXT* av1, FREERDP_AV1_CONTEXT_OPTION option)
 {
+	WINPR_ASSERT(av1);
+
+	if (!av1->encoder)
+		return 0;
+
 	switch (option)
 	{
 		case FREERDP_AV1_CONTEXT_OPTION_PROFILE:
-			if (!av1->encoder)
-				return 0;
-			return av1->ecfg.g_profile;
+			return av1->profile;
 		case FREERDP_AV1_CONTEXT_OPTION_RATECONTROL:
-			if (!av1->encoder)
-				return 0;
-			return av1->ecfg.rc_end_usage;
+			return av1->ratecontrol;
 		case FREERDP_AV1_CONTEXT_OPTION_BITRATE:
-			if (!av1->encoder)
-				return 0;
-			return av1->ecfg.rc_target_bitrate;
+			return av1->bitrate;
 		case FREERDP_AV1_CONTEXT_OPTION_USAGETYPE:
-			if (!av1->encoder)
-				return 0;
-			return av1->ecfg.g_usage;
+			return av1->usagetype;
 		default:
 			WLog_Print(av1->log, WLOG_ERROR, "Unknown FREERDP_AV1_CONTEXT_OPTION[0x%08" PRIx32 "]",
 			           option);
@@ -173,131 +701,59 @@ INT32 freerdp_av1_compress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, DWORD
                            const RECTANGLE_16* regionRect, BYTE** ppDstData, UINT32* pDstSize,
                            RDPGFX_H264_METABLOCK* meta)
 {
+	WINPR_ASSERT(av1);
+	WINPR_ASSERT(ppDstData);
+	WINPR_ASSERT(pDstSize);
+	WINPR_ASSERT(meta);
+
+	WINPR_UNUSED(regionRect);
+
 	*ppDstData = nullptr;
 	*pDstSize = 0;
+	av1->bitstreamSize = 0;
 
 	if (!av1->encoder)
 	{
-		WLog_Print(av1->log, WLOG_ERROR, "av1->encoder: %d", av1->encoder);
+		WLog_Print(av1->log, WLOG_ERROR, "AV1 context is not an encoder");
 		return -1;
 	}
 
-	primitives_t* primitives = primitives_get();
-	if (!primitives)
+	if (!av1->initialized && !freerdp_av1_context_reset(av1, nSrcWidth, nSrcHeight))
+		return -1;
+
+	if ((av1->width != nSrcWidth) || (av1->height != nSrcHeight))
 	{
-		WLog_Print(av1->log, WLOG_ERROR, "primitives_get(): nullptr");
+		WLog_Print(av1->log, WLOG_ERROR,
+		           "AV1 context size %" PRIu32 "x%" PRIu32 " does not match source %" PRIu32
+		           "x%" PRIu32,
+		           av1->width, av1->height, nSrcWidth, nSrcHeight);
 		return -1;
 	}
 
-	if (av1->yuvWidth != nSrcWidth)
-	{
-		WLog_Print(av1->log, WLOG_ERROR, "av1->yuvWidth[%" PRIu32 "] != nSrcWidth[%" PRIu32 "]",
-		           av1->yuvWidth, nSrcWidth);
-		return -1;
-	}
-
-	if (av1->yuvHeight != nSrcHeight)
-	{
-		WLog_Print(av1->log, WLOG_ERROR, "av1->yuvHeight[%" PRIu32 "] != nSrcHeight[%" PRIu32 "]",
-		           av1->yuvHeight, nSrcHeight);
-		return -1;
-	}
-
-	const prim_size_t roi = { .width = nSrcWidth, .height = nSrcHeight };
-
-	aom_image_t buffer = WINPR_C_ARRAY_INIT;
-
-	aom_image_t* img = &buffer;
-#if defined(WITH_LIBYUV)
-	int rec = -1;
-	switch (av1->ecfg.g_profile)
-	{
-		case 0:
-			img->fmt = AOM_IMG_FMT_I420;
-			img->x_chroma_shift = 1;
-			img->y_chroma_shift = 1;
-			rec = ARGBToI420(pSrcData, nSrcStep, av1->yuvdata[0], av1->yuvStride[0],
-			                 av1->yuvdata[1], av1->yuvStride[1], av1->yuvdata[2],
-			                 WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[2]),
-			                 WINPR_ASSERTING_INT_CAST(int, roi.width),
-			                 WINPR_ASSERTING_INT_CAST(int, roi.height));
-			break;
-		case 1:
-			img->fmt = AOM_IMG_FMT_I444;
-			rec = ARGBToI444(pSrcData, nSrcStep, av1->yuvdata[0], av1->yuvStride[0],
-			                 av1->yuvdata[1], av1->yuvStride[1], av1->yuvdata[2],
-			                 WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[2]),
-			                 WINPR_ASSERTING_INT_CAST(int, roi.width),
-			                 WINPR_ASSERTING_INT_CAST(int, roi.height));
-			break;
-		default:
-			WLog_Print(av1->log, WLOG_ERROR, "Unsupoorted AV1 profile %" PRIu32,
-			           av1->ecfg.g_profile);
-			return -1;
-	}
+	const pstatus_t rec =
+	    av1_convert_rgb_to_yuv(av1, pSrcData, SrcFormat, nSrcStep, nSrcWidth, nSrcHeight);
 	if (rec != 0)
 	{
-		WLog_Print(av1->log, WLOG_ERROR, "ARGBToI444(): %d", rec);
+		WLog_Print(av1->log, WLOG_ERROR, "AV1 RGB to YUV conversion failed: %d", rec);
 		return -1;
 	}
-#else
-	pstatus_t rec = -1;
-	switch (av1->ecfg.g_profile)
+
+	INT32 rc = -1;
+	switch (av1->backend)
 	{
-		case 0:
-			img->fmt = AOM_IMG_FMT_I420;
-			img->x_chroma_shift = 1;
-			img->y_chroma_shift = 1;
-			rec = primitives->RGBToYUV420_8u_P3AC4R(pSrcData, SrcFormat, nSrcStep, av1->yuvdata,
-			                                        av1->yuvStride, &roi);
+#if defined(WITH_LIBAOM)
+		case FREERDP_AV1_BACKEND_AOM:
+			rc = av1_aom_compress(av1, ppDstData, pDstSize);
 			break;
-		case 1:
-			img->fmt = AOM_IMG_FMT_I444;
-			rec = primitives->RGBToI444_8u(pSrcData, SrcFormat, nSrcStep, av1->yuvdata,
-			                               av1->yuvStride, &roi);
-			break;
-		default:
-			WLog_Print(av1->log, WLOG_ERROR, "Unsupoorted AV1 profile %" PRIu32,
-			           av1->ecfg.g_profile);
-			return -1;
-	}
-	if (rec != 0)
-	{
-		WLog_Print(av1->log, WLOG_ERROR, "primitives->RGBToI444_8u(): %d", rec);
-		return -1;
-	}
 #endif
-	img->bit_depth = 8;
-	img->d_w = img->r_w = img->w = roi.width;
-	img->d_h = img->r_h = img->h = roi.height;
-	img->stride[0] = WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[0]);
-	img->stride[1] = WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[1]);
-	img->stride[2] = WINPR_ASSERTING_INT_CAST(int, av1->yuvStride[2]);
-	img->planes[0] = av1->yuvdata[0];
-	img->planes[1] = av1->yuvdata[1];
-	img->planes[2] = av1->yuvdata[2];
-
-	const aom_codec_err_t rc = aom_codec_encode(&av1->ctx, img, ++av1->framecount, 1, av1->eflags);
-	aom_img_free(img);
-
-	if (rc != AOM_CODEC_OK)
-	{
-		WLog_Print(av1->log, WLOG_WARN, "aom_codec_encode: %s", aom_codec_err_to_string(rc));
-		return -1;
+		case FREERDP_AV1_BACKEND_NONE:
+		default:
+			WLog_Print(av1->log, WLOG_ERROR, "No AV1 encoder backend initialized");
+			return -1;
 	}
 
-	aom_codec_iter_t iter = nullptr;
-	const aom_codec_cx_pkt_t* pkt = nullptr;
-	while ((pkt = aom_codec_get_cx_data(&av1->ctx, &iter)) != nullptr)
-	{
-		if (pkt->kind != AOM_CODEC_CX_FRAME_PKT)
-			continue;
-
-		*ppDstData = pkt->data.frame.buf;
-		*pDstSize = pkt->data.frame.sz;
-	};
-	if (*pDstSize == 0)
-		return 0;
+	if (rc <= 0)
+		return rc;
 
 	RECTANGLE_16* rect = calloc(1, sizeof(RECTANGLE_16));
 	if (rect)
@@ -314,149 +770,51 @@ INT32 freerdp_av1_decompress(FREERDP_AV1_CONTEXT* av1, const BYTE* pSrcData, UIN
                              UINT32 numRegionRect)
 {
 	WINPR_ASSERT(av1);
+
+	WINPR_UNUSED(regionRects);
+	WINPR_UNUSED(numRegionRect);
+
 	if (av1->encoder)
 	{
-		WLog_Print(av1->log, WLOG_ERROR, "av1->encoder: %d", av1->encoder);
+		WLog_Print(av1->log, WLOG_ERROR, "AV1 context is not a decoder");
 		return -1;
 	}
 
-	const aom_codec_err_t rc = aom_codec_decode(&av1->ctx, pSrcData, SrcSize, nullptr);
-	if (rc != AOM_CODEC_OK)
-	{
-		WLog_Print(av1->log, WLOG_WARN, "aom_codec_decode: %s", aom_codec_err_to_string(rc));
+	if (!av1->initialized && !freerdp_av1_context_reset(av1, nDstWidth, nDstHeight))
 		return -1;
-	}
 
-	aom_image_t* img = nullptr;
-	aom_codec_iter_t iter = nullptr;
-	while ((img = aom_codec_get_frame(&av1->ctx, &iter)) != nullptr)
+	switch (av1->backend)
 	{
-		const prim_size_t roi = { .width = nDstWidth, .height = nDstHeight };
-
-#if defined(WITH_LIBYUV)
-		int rec = -1;
-
-		switch (img->fmt)
-		{
-			case AOM_IMG_FMT_I420:
-				rec = J420ToARGB(img->planes[0], img->stride[0], img->planes[1], img->stride[1],
-				                 img->planes[2], img->stride[2], pDstData, nDstStep, nDstWidth,
-				                 nDstHeight);
-				break;
-			case AOM_IMG_FMT_I444:
-				rec = J444ToARGB(img->planes[0], img->stride[0], img->planes[1], img->stride[1],
-				                 img->planes[2], img->stride[2], pDstData, nDstStep, nDstWidth,
-				                 nDstHeight);
-				break;
-			default:
-				WLog_Print(av1->log, WLOG_ERROR, "img->fmt %d not supported", img->fmt);
-				return -1;
-		}
-		if (rec != 0)
-		{
-			WLog_Print(av1->log, WLOG_ERROR, "I444ToABGR() %d", rec);
-			return -1;
-		}
-#else
-		const BYTE* pSrc[] = { img->planes[0], img->planes[1], img->planes[2] };
-		const UINT32 strides[] = { img->stride[0], img->stride[1], img->stride[2] };
-
-		primitives_t* primitives = primitives_get();
-		if (!primitives)
-		{
-			WLog_Print(av1->log, WLOG_ERROR, "primitives_get(): nullptr");
-			return FALSE;
-		}
-
-		pstatus_t rec = -1;
-		switch (img->fmt)
-		{
-			case AOM_IMG_FMT_I420:
-				rec = primitives->YUV420ToRGB_8u_P3AC4R(pSrc, strides, pDstData, nDstStep,
-				                                        DstFormat, &roi);
-				break;
-			case AOM_IMG_FMT_I444:
-				rec = primitives->YUV444ToRGB_8u_P3AC4R(pSrc, strides, pDstData, nDstStep,
-				                                        DstFormat, &roi);
-				break;
-			default:
-				WLog_Print(av1->log, WLOG_ERROR, "img->fmt %d not supported", img->fmt);
-				return -1;
-		}
-		if (rec != 0)
-		{
-			WLog_Print(av1->log, WLOG_ERROR, "I444ToABGR() %d", rec);
-			return -1;
-		}
+#if defined(WITH_LIBAOM)
+		case FREERDP_AV1_BACKEND_AOM:
+			return av1_aom_decompress(av1, pSrcData, SrcSize, pDstData, DstFormat, nDstStep,
+			                          nDstWidth, nDstHeight);
 #endif
+		case FREERDP_AV1_BACKEND_NONE:
+		default:
+			WLog_Print(av1->log, WLOG_ERROR, "No AV1 decoder backend initialized");
+			return -1;
 	}
-
-	return TRUE;
 }
 
 BOOL freerdp_av1_context_reset(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
 {
-	if (av1->encoder)
-	{
-		av1->ecfg.g_w = width;
-		av1->ecfg.g_h = height;
+	WINPR_ASSERT(av1);
 
-		if (av1->initialized)
-		{
-			const aom_codec_err_t rc = aom_codec_destroy(&av1->ctx);
-			av1->initialized = false;
-			if (rc != AOM_CODEC_OK)
-			{
-				WLog_Print(av1->log, WLOG_WARN, "aom_codec_destroy: %s",
-				           aom_codec_err_to_string(rc));
-				return FALSE;
-			}
-		}
+	if ((width == 0) || (height == 0))
+		return FALSE;
 
-		const aom_codec_err_t rc =
-		    aom_codec_enc_init(&av1->ctx, av1->iface, &av1->ecfg, av1->flags);
-		if (rc != AOM_CODEC_OK)
-		{
-			WLog_Print(av1->log, WLOG_WARN, "aom_codec_enc_init: %s", aom_codec_err_to_string(rc));
-			return FALSE;
-		}
+	av1->width = width;
+	av1->height = height;
+	av1->framecount = 0;
 
-		av1->framecount = 0;
-		av1->eflags = 0; // AOM_EFLAG_FORCE_KF;
-	}
-	else
-	{
-		av1->dcfg.w = width;
-		av1->dcfg.h = height;
-		av1->dcfg.allow_lowbitdepth = 1;
-		const aom_codec_err_t rc =
-		    aom_codec_dec_init(&av1->ctx, av1->iface, &av1->dcfg, av1->flags);
-		if (rc != AOM_CODEC_OK)
-		{
-			WLog_Print(av1->log, WLOG_WARN, "aom_codec_dec_init: %s", aom_codec_err_to_string(rc));
-			return FALSE;
-		}
-	}
-	av1->initialized = true;
+	if (av1->encoder && !av1_allocate_yuv(av1, width, height))
+		return FALSE;
 
-	av1->yuvWidth = width;
-	av1->yuvStride[0] = width;
+	if (!av1_reinit_backend(av1, width, height))
+		return FALSE;
 
-	const size_t pad = av1->yuvStride[0] % 16;
-	if (pad != 0)
-		av1->yuvStride[0] += 16 - pad;
-	av1->yuvStride[0] *= 3;
-	av1->yuvStride[1] = width;
-	av1->yuvStride[2] = width;
-
-	av1->yuvHeight = height;
-	winpr_aligned_free(av1->yuvdata[0]);
-	winpr_aligned_free(av1->yuvdata[1]);
-	winpr_aligned_free(av1->yuvdata[2]);
-	av1->yuvdata[0] = winpr_aligned_malloc(1ull * av1->yuvStride[0] * av1->yuvHeight, 64);
-	av1->yuvdata[1] = winpr_aligned_malloc(1ull * av1->yuvStride[1] * av1->yuvHeight, 64);
-	av1->yuvdata[2] = winpr_aligned_malloc(1ull * av1->yuvStride[2] * av1->yuvHeight, 64);
-	return av1->yuvdata[0] != nullptr;
+	return TRUE;
 }
 
 void freerdp_av1_context_free(FREERDP_AV1_CONTEXT* av1)
@@ -464,17 +822,9 @@ void freerdp_av1_context_free(FREERDP_AV1_CONTEXT* av1)
 	if (!av1)
 		return;
 
-	if (av1->initialized)
-	{
-		const aom_codec_err_t rc = aom_codec_destroy(&av1->ctx);
-		if (rc != AOM_CODEC_OK)
-		{
-			WLog_Print(av1->log, WLOG_WARN, "aom_codec_destroy: %s", aom_codec_err_to_string(rc));
-		}
-	}
-	winpr_aligned_free(av1->yuvdata[0]);
-	winpr_aligned_free(av1->yuvdata[1]);
-	winpr_aligned_free(av1->yuvdata[2]);
+	av1_backend_uninit(av1);
+	av1_free_yuv(av1);
+	free(av1->bitstream);
 	free(av1);
 }
 
@@ -483,38 +833,34 @@ FREERDP_AV1_CONTEXT* freerdp_av1_context_new(BOOL Compressor)
 	FREERDP_AV1_CONTEXT* ctx = calloc(1, sizeof(FREERDP_AV1_CONTEXT));
 	if (!ctx)
 		return nullptr;
+
 	ctx->encoder = Compressor;
+	ctx->backend = FREERDP_AV1_BACKEND_NONE;
+	ctx->profile = 0;
+	ctx->ratecontrol = FREERDP_AV1_VBR;
+	ctx->bitrate = 500;
+	ctx->usagetype = av1_default_usage();
 	ctx->log = WLog_Get(TAG);
 	if (!ctx->log)
 		goto fail;
 
+#if defined(WITH_LIBAOM)
 	if (Compressor)
 	{
-		ctx->iface = aom_codec_av1_cx();
-		if (!ctx->iface)
+		aom_codec_iface_t* iface = aom_codec_av1_cx();
+		if (iface)
 		{
-			WLog_Print(ctx->log, WLOG_ERROR, "aom_codec_av1_cx() nullptr");
-			goto fail;
-		}
-
-		const aom_codec_err_t rc =
-		    aom_codec_enc_config_default(ctx->iface, &ctx->ecfg, AOM_USAGE_REALTIME);
-		if (rc != AOM_CODEC_OK)
-		{
-			WLog_Print(ctx->log, WLOG_ERROR, "aom_codec_enc_config_default() %s",
-			           aom_codec_err_to_string(rc));
-			goto fail;
+			aom_codec_enc_cfg_t cfg = WINPR_C_ARRAY_INIT;
+			const aom_codec_err_t rc = aom_codec_enc_config_default(iface, &cfg, ctx->usagetype);
+			if (rc == AOM_CODEC_OK)
+			{
+				ctx->profile = cfg.g_profile;
+				ctx->ratecontrol = cfg.rc_end_usage;
+				ctx->bitrate = cfg.rc_target_bitrate;
+			}
 		}
 	}
-	else
-	{
-		ctx->iface = aom_codec_av1_dx();
-		if (!ctx->iface)
-		{
-			WLog_Print(ctx->log, WLOG_ERROR, "aom_codec_av1_dx() nullptr");
-			goto fail;
-		}
-	}
+#endif
 
 	return ctx;
 
@@ -522,77 +868,3 @@ fail:
 	freerdp_av1_context_free(ctx);
 	return nullptr;
 }
-#else
-
-struct S_FREERDP_AV1_CONTEXT
-{
-	BOOL Compressor;
-	wLog* log;
-};
-
-BOOL freerdp_av1_context_set_option(WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT* av1,
-                                    WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT_OPTION option,
-                                    WINPR_ATTR_UNUSED UINT32 value)
-{
-	return FALSE;
-}
-
-UINT32 freerdp_av1_context_get_option(WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT* av1,
-                                      WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT_OPTION option)
-{
-	return 0;
-}
-
-INT32 freerdp_av1_compress(WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT* av1,
-                           WINPR_ATTR_UNUSED const BYTE* pSrcData,
-                           WINPR_ATTR_UNUSED DWORD SrcFormat, WINPR_ATTR_UNUSED UINT32 nSrcStep,
-                           WINPR_ATTR_UNUSED UINT32 nSrcWidth, WINPR_ATTR_UNUSED UINT32 nSrcHeight,
-                           WINPR_ATTR_UNUSED const RECTANGLE_16* regionRect,
-                           WINPR_ATTR_UNUSED BYTE** ppDstData, WINPR_ATTR_UNUSED UINT32* pDstSize,
-                           WINPR_ATTR_UNUSED RDPGFX_H264_METABLOCK* meta)
-{
-	WINPR_ASSERT(av1);
-	WLog_Print(av1->log, WLOG_ERROR,
-	           "This build does not support AV1 codec. Recompile with '-DWITH_AOM=ON'");
-	return -1;
-}
-
-INT32 freerdp_av1_decompress(WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT* av1,
-                             WINPR_ATTR_UNUSED const BYTE* pSrcData,
-                             WINPR_ATTR_UNUSED UINT32 SrcSize, WINPR_ATTR_UNUSED BYTE* pDstData,
-                             WINPR_ATTR_UNUSED DWORD DstFormat, WINPR_ATTR_UNUSED UINT32 nDstStep,
-                             WINPR_ATTR_UNUSED UINT32 nDstWidth,
-                             WINPR_ATTR_UNUSED UINT32 nDstHeight,
-                             WINPR_ATTR_UNUSED const RECTANGLE_16* regionRects,
-                             WINPR_ATTR_UNUSED UINT32 numRegionRect)
-{
-	WINPR_ASSERT(av1);
-	WLog_Print(av1->log, WLOG_ERROR,
-	           "This build does not support AV1 codec. Recompile with '-DWITH_AOM=ON'");
-	return -1;
-}
-
-BOOL freerdp_av1_context_reset(WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT* av1,
-                               WINPR_ATTR_UNUSED UINT32 width, WINPR_ATTR_UNUSED UINT32 height)
-{
-	WINPR_ASSERT(av1);
-	WLog_Print(av1->log, WLOG_WARN,
-	           "This build does not support AV1 codec. Recompile with '-DWITH_AOM=ON'");
-	return FALSE;
-}
-
-void freerdp_av1_context_free(WINPR_ATTR_UNUSED FREERDP_AV1_CONTEXT* av1)
-{
-	free(av1);
-}
-
-FREERDP_AV1_CONTEXT* freerdp_av1_context_new(BOOL Compressor)
-{
-	FREERDP_AV1_CONTEXT* ctx = calloc(1, sizeof(FREERDP_AV1_CONTEXT));
-	if (!ctx)
-		return nullptr;
-	ctx->Compressor = Compressor;
-	ctx->log = WLog_Get(TAG);
-	return ctx;
-}
-#endif
