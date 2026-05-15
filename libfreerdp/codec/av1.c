@@ -553,7 +553,11 @@ static BOOL av1_svt_init(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
 	av1->svtCfg.encoder_color_format = EB_YUV420;
 	av1->svtCfg.profile = MAIN_PROFILE;
 	av1->svtCfg.enc_mode = 13;
+#if defined(SVT_AV1_PRED_LOW_DELAY_B)
 	av1->svtCfg.pred_structure = SVT_AV1_PRED_LOW_DELAY_B;
+#else
+	av1->svtCfg.pred_structure = LOW_DELAY;
+#endif
 	av1->svtCfg.hierarchical_levels = 2;
 	av1->svtCfg.intra_period_length = 63;
 	av1->svtCfg.rate_control_mode = av1_svt_ratecontrol(av1->ratecontrol);
@@ -562,7 +566,9 @@ static BOOL av1_svt_init(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
 	    (av1->bitrate > (UINT32_MAX / 1000u)) ? UINT32_MAX : av1->bitrate * 1000u;
 	av1->svtCfg.max_bit_rate = 0;
 	av1->svtCfg.look_ahead_distance = 0;
+#if !defined(SVT_AV1_CHECK_VERSION) || !SVT_AV1_CHECK_VERSION(4, 0, 0)
 	av1->svtCfg.enable_tpl_la = 0;
+#endif
 	av1->svtCfg.enable_tf = 0;
 	av1->svtCfg.enable_dg = 0;
 	av1->svtCfg.startup_mg_size = 0;

@@ -5,19 +5,28 @@ set -uo pipefail
 SCRIPT_PATH=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_PATH/../.." && pwd)
 
+# the order here is rolling for each family and then each family is sorted new to old
 DEFAULT_IMAGES=(
-	"debian:stable-slim"
-	"opensuse/leap:15"
-	"almalinux:9"
+	"archlinux:base-devel"
+	"debian:sid-slim"
 	"opensuse/tumbleweed:latest"
 	"fedora:rawhide"
-	"almalinux:10"
-	"almalinux:8"
-	"opensuse/leap:16.0"
+	"almalinux:10-kitten"
 	"ubuntu:26.04"
 	"ubuntu:24.04"
 	"ubuntu:22.04"
-	"debian:sid-slim"
+    "ubuntu:20.04"
+	"fedora:44"
+    "fedora:43"
+	"almalinux:10"
+    "almalinux:9"
+	"almalinux:8"
+	"opensuse/leap:16.0"
+	"opensuse/leap:15"
+	"debian:bullseye-slim"
+    "debian:bookworm-slim"
+    "debian:trixie-slim"
+	"debian:forky-slim"
 )
 
 IMAGES=()
@@ -35,7 +44,7 @@ usage()
 	cat <<EOF
 Usage: ${0##*/} [options]
 
-Build the nightly Debian/RPM packages inside locally available Docker distro
+Build the nightly Debian/RPM/Arch packages inside locally available Docker distro
 images. The source is a snapshot of the current working tree, so uncommitted
 changes are tested. The script writes a generated Dockerfile per image and uses
 cached bootstrap/build-dependency stages to speed up repeated runs.
@@ -287,6 +296,7 @@ fi
 		case "$path" in
 			packaging/deb/freerdp-nightly | packaging/deb/freerdp-nightly/* | \
 				packaging/rpm/freerdp-nightly.spec | \
+				packaging/scripts/arch_PKGBUILD | \
 				packaging/scripts/prepare_deb_freerdp-nightly.sh)
 				printf '%s\0' "$path"
 				;;
@@ -401,6 +411,91 @@ build_deb()
 		-exec cp -v {} "$(artifact_dir)"/ \;
 }
 
+install_arch_bootstrap()
+{
+	log "Installing Arch package-build bootstrap"
+	pacman -Syu --noconfirm --needed \
+		base-devel \
+		ca-certificates \
+		git \
+		sudo \
+		tar \
+		xz
+
+	if ! id -u builduser >/dev/null 2>&1; then
+		useradd -m -U builduser
+	fi
+	printf 'builduser ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/builduser
+	chmod 0440 /etc/sudoers.d/builduser
+}
+
+setup_arch_bootstrap()
+{
+	if env_true "${FREERDP_PACKAGE_TEST_SKIP_BOOTSTRAP:-0}"; then
+		log "Using cached Arch package-build bootstrap"
+		return
+	fi
+
+	install_arch_bootstrap
+}
+
+prepare_arch_build_context()
+{
+	log "Preparing Arch makepkg context"
+	rm -rf /work/arch-build /work/arch-src
+	mkdir -p /work/arch-build /work/arch-src/freerdp
+	tar -C /work/src -cf - . | tar -C /work/arch-src/freerdp -xf -
+	tar -C /work/arch-src -czf /work/arch-build/freerdp-src.tar.gz freerdp
+	cp -v /work/src/packaging/scripts/arch_PKGBUILD /work/arch-build/PKGBUILD
+	chown -R builduser:builduser /work/arch-build
+}
+
+install_arch_builddeps_from_pkgbuild()
+{
+	local -a packages=()
+
+	log "Installing Arch package dependencies"
+	# shellcheck disable=SC1091
+	source /work/arch-build/PKGBUILD
+	packages=("${depends[@]}" "${makedepends[@]}")
+	if [[ ${#packages[@]} -gt 0 ]]; then
+		pacman -S --noconfirm --needed "${packages[@]}"
+	fi
+}
+
+install_arch_builddeps()
+{
+	setup_arch_bootstrap
+	prepare_source
+	prepare_arch_build_context
+	install_arch_builddeps_from_pkgbuild
+}
+
+build_arch()
+{
+	setup_arch_bootstrap
+	prepare_source
+	prepare_arch_build_context
+
+	if env_true "${FREERDP_PACKAGE_TEST_SKIP_BUILDDEPS:-0}"; then
+		log "Using cached Arch package dependencies"
+	else
+		install_arch_builddeps_from_pkgbuild
+	fi
+
+	log "Building Arch package"
+	cd /work/arch-build
+	sudo -u builduser \
+		env \
+		CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}" \
+		FREERDP_SOURCE_ARCHIVE=/work/arch-build/freerdp-src.tar.gz \
+		makepkg --noconfirm --needed --cleanbuild --force
+
+	log "Collecting Arch artifacts"
+	find /work/arch-build -maxdepth 1 \( -name '*.pkg.tar.*' -o -name '*.src.tar.*' \) \
+		-exec cp -v {} "$(artifact_dir)"/ \;
+}
+
 configure_dnf_commands()
 {
 	local dnf_cmd
@@ -414,6 +509,7 @@ configure_dnf_commands()
 install_dnf_bootstrap()
 {
 	local dnf_cmd
+	local alma_release_devel=almalinux-release-devel
 
 	dnf_cmd=$(command -v dnf5 || command -v dnf)
 	log "Installing RPM package-build bootstrap with ${dnf_cmd}"
@@ -428,7 +524,11 @@ install_dnf_bootstrap()
 		xz || true
 
 	if [[ -f /etc/almalinux-release ]]; then
-		"${dnf_cmd}" -y install epel-release almalinux-release-devel || true
+		if [[ "${NAME:-}" == "AlmaLinux Kitten" ]]; then
+			alma_release_devel=almalinux-kitten-release-devel
+		fi
+		"${dnf_cmd}" -y install epel-release || true
+		"${dnf_cmd}" -y install "$alma_release_devel" || true
 		if [[ "${VERSION_ID:-}" == 8* ]]; then
 			"${dnf_cmd}" config-manager --set-enabled powertools || true
 		else
@@ -621,6 +721,8 @@ main()
 	if [[ "${MODE:-package}" == "bootstrap" ]]; then
 		if command -v apt-get >/dev/null 2>&1; then
 			install_deb_bootstrap
+		elif command -v pacman >/dev/null 2>&1; then
+			install_arch_bootstrap
 		elif command -v zypper >/dev/null 2>&1 || command -v dnf5 >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
 			install_rpm_bootstrap
 		else
@@ -631,7 +733,7 @@ main()
 	fi
 
 	if [[ "${MODE:-package}" == "probe" ]]; then
-		log "Package manager: $(command -v apt-get || command -v zypper || command -v dnf5 || command -v dnf || printf unknown)"
+		log "Package manager: $(command -v apt-get || command -v pacman || command -v zypper || command -v dnf5 || command -v dnf || printf unknown)"
 		log "Checking source snapshot"
 		test -s /input/freerdp-src.tar.gz
 		return 0
@@ -645,6 +747,12 @@ main()
 				log "Using cached Debian Build-Depends"
 			else
 				install_deb_builddeps
+			fi
+		elif command -v pacman >/dev/null 2>&1; then
+			if env_true "${FREERDP_PACKAGE_TEST_SKIP_BUILDDEPS:-0}"; then
+				log "Using cached Arch package dependencies"
+			else
+				install_arch_builddeps
 			fi
 		elif command -v zypper >/dev/null 2>&1 || command -v dnf5 >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
 			setup_rpm_bootstrap
@@ -663,6 +771,8 @@ main()
 
 	if command -v apt-get >/dev/null 2>&1; then
 		build_deb
+	elif command -v pacman >/dev/null 2>&1; then
+		build_arch
 	elif command -v zypper >/dev/null 2>&1 || command -v dnf5 >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
 		build_rpm
 	else

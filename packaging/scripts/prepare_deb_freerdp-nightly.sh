@@ -16,6 +16,16 @@ fi
 cp -a packaging/deb/freerdp-nightly debian
 
 optional_build_depends=""
+disable_optional_av1=0
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  if [ "${ID:-}" = ubuntu ] && [ "${VERSION_ID:-}" = 20.04 ]; then
+    # Ubuntu 20.04 ships libaom 1.0.0, too old for the nightly AV1 package path.
+    disable_optional_av1=1
+  fi
+fi
+
 if command -v apt-cache >/dev/null 2>&1; then
   add_optional_build_depend() {
     pkg=$1
@@ -35,9 +45,11 @@ if command -v apt-cache >/dev/null 2>&1; then
     fi
   }
 
-  add_optional_build_depend libaom-dev
-  add_optional_build_depend libsvtav1-dev 3.0
-  add_optional_build_depend libdav1d-dev
+  if [ "$disable_optional_av1" != 1 ]; then
+    add_optional_build_depend libaom-dev
+    add_optional_build_depend libsvtav1-dev 3.0
+    add_optional_build_depend libdav1d-dev
+  fi
   add_optional_build_depend libopenh264-dev
   add_optional_build_depend libyuv-dev
   add_optional_build_depend libmp3lame-dev

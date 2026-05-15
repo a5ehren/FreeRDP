@@ -29,11 +29,23 @@ DEB_CMAKE_EXTRA_FLAGS := \
 						  $(SANITIZE_ADDRESS) \
 						  $(NULL)
 
+DEB_DISTRO_ID := $(shell . /etc/os-release 2>/dev/null; printf '%s' "$$ID")
+DEB_DISTRO_VERSION_ID := $(shell . /etc/os-release 2>/dev/null; printf '%s' "$$VERSION_ID")
+ifeq ($(DEB_DISTRO_ID):$(DEB_DISTRO_VERSION_ID),ubuntu:20.04)
+# Ubuntu 20.04 ships libaom 1.0.0, too old for the nightly AV1 package path.
+DEB_CMAKE_EXTRA_FLAGS += \
+						  -DWITH_GFX_AV1=OFF \
+						  -DWITH_AOM=OFF \
+						  -DWITH_SVTAV1=OFF \
+						  -DWITH_DAV1D=OFF \
+						  $(NULL)
+endif
+
 %:
-	dh $@ --parallel
+	dh $@ --parallel --buildsystem=cmake+ninja
 
 override_dh_auto_configure:
-	dh_auto_configure -- -DCMAKE_MODULE_PATH=$(PWD)/cmake -GNinja -C $(PWD)/packaging/deb/freerdp-nightly/cmake-preload.cmake $(DEB_CMAKE_EXTRA_FLAGS)
+	dh_auto_configure --buildsystem=cmake+ninja -- -DCMAKE_MODULE_PATH=$(PWD)/cmake -DCMAKE_PROJECT_FreeRDP_INCLUDE=$(PWD)/packaging/deb/freerdp-nightly/cmake-preload.cmake $(DEB_CMAKE_EXTRA_FLAGS)
 
 override_dh_shlibdeps:
 	dh_shlibdeps -l /opt/freerdp-nightly/lib/
