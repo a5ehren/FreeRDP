@@ -553,10 +553,10 @@ static BOOL av1_svt_init(FREERDP_AV1_CONTEXT* av1, UINT32 width, UINT32 height)
 	av1->svtCfg.encoder_color_format = EB_YUV420;
 	av1->svtCfg.profile = MAIN_PROFILE;
 	av1->svtCfg.enc_mode = 13;
-#if defined(SVT_AV1_PRED_LOW_DELAY_B)
-	av1->svtCfg.pred_structure = SVT_AV1_PRED_LOW_DELAY_B;
-#else
+#if defined(SVT_AV1_CHECK_VERSION) && SVT_AV1_CHECK_VERSION(4, 0, 0)
 	av1->svtCfg.pred_structure = LOW_DELAY;
+#else
+	av1->svtCfg.pred_structure = SVT_AV1_PRED_LOW_DELAY_B;
 #endif
 	av1->svtCfg.hierarchical_levels = 2;
 	av1->svtCfg.intra_period_length = 63;

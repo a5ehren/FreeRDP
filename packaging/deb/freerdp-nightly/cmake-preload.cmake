@@ -10,7 +10,7 @@ endif()
 
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-  pkg_check_modules(FREERDP_NIGHTLY_AOM QUIET aom)
+  pkg_check_modules(FREERDP_NIGHTLY_AOM QUIET aom>=2.0)
   pkg_check_modules(FREERDP_NIGHTLY_SVTAV1 QUIET SvtAv1Enc>=3.0)
   pkg_check_modules(FREERDP_NIGHTLY_DAV1D QUIET dav1d>=1.0)
   pkg_check_modules(FREERDP_NIGHTLY_OPENH264 QUIET openh264)

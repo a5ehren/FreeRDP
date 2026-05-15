@@ -15,7 +15,7 @@ arch=('x86_64')
 
 depends=(
   'alsa-lib'
-  'aom'
+  'aom>=2.0'
   'cairo'
   'cjson'
   'dav1d'

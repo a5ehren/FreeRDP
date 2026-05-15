@@ -118,7 +118,7 @@ BuildRequires: libyuv-devel
 %endif
 
 %if %{with av1}
-BuildRequires: pkgconfig(aom)
+BuildRequires: pkgconfig(aom) >= 2.0
 %if %{with svtav1}
 BuildRequires: pkgconfig(SvtAv1Enc) >= 3.0
 %endif

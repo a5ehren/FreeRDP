@@ -46,7 +46,7 @@ if command -v apt-cache >/dev/null 2>&1; then
   }
 
   if [ "$disable_optional_av1" != 1 ]; then
-    add_optional_build_depend libaom-dev
+    add_optional_build_depend libaom-dev 2.0
     add_optional_build_depend libsvtav1-dev 3.0
     add_optional_build_depend libdav1d-dev
   fi
